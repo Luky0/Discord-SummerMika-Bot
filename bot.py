@@ -1,85 +1,483 @@
 import os
+import json
 import discord
-import responses
 from discord.ext import commands
-from discord.utils import get
+import aiohttp
+from PIL import Image
+import io
+import re
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import asyncio
+import base64
+from openai import OpenAI
 
+load_dotenv("secrets.env")
 
-load_dotenv()
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("No token found! Make sure you have a .env file.")
 
-async def send_message(message, user_message, is_private):
+DB_FILE = "database.json"
+
+client = OpenAI(
+    api_key=os.getenv("CLOUDFLARE_API_KEY"),
+    base_url=f"https://api.cloudflare.com/client/v4/accounts/{os.getenv('CLOUDFLARE_ACCOUNT_ID')}/ai/v1"
+)
+
+# Initialize intents and bot
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='~', intents=intents)
+
+bot.remove_command('help')
+
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    return {"processed_messages": [], "days": {}}
+
+def save_db(data):
+    with open(DB_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def extract_data_from_image(image_bytes, force_parse=False):
+    """Uses Cloudflare's free Llama 3.2 Vision model."""
     try:
-        response = responses.get_response(user_message)
-        await message.author.send(response) if is_private else await message.channel.send(response)
-
+        original_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        
+        # We still crop and compress to save your free daily Neurons!
+        width, height = original_img.size
+        cropped_img = original_img.crop((0, int(height * 0.55), width, height))
+        
+        if cropped_img.width > 800:
+            ratio = 800 / cropped_img.width
+            new_height = int(cropped_img.height * ratio)
+            cropped_img = cropped_img.resize((800, new_height), Image.Resampling.LANCZOS)
+            
+        # Convert the cropped PIL image back to base64 bytes for the API
+        buffered = io.BytesIO()
+        cropped_img.save(buffered, format="JPEG")
+        base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        # Blast it to Cloudflare! No sleep timer needed.
+        response = client.chat.completions.create(
+            model="@cf/mistralai/mistral-small-3.1-24b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Find the '1st place' wins and 'Races' from this game result. Return ONLY a JSON object exactly like this: {\"wins\": 15, \"races\": 40}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }
+            ]
+        )
+        
+        # Parse the JSON from the AI's reply
+        reply_text = response.choices[0].message.content
+        
+        # Quick regex to grab the JSON block in case Llama adds conversational text
+        json_match = re.search(r'\{.*?\}', reply_text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            wins = data.get("wins", -1)
+            races = data.get("races", -1)
+            
+            # Use our bulletproof modulo 5 math check!
+            if isinstance(wins, int) and isinstance(races, int):
+                if 5 <= races <= 80 and races % 5 == 0 and wins <= races:
+                    return wins, races
+                    
     except Exception as e:
-        print(e)
+        print(f"Cloudflare Vision API Error: {e}")
+        
+    return None, None
+
+def get_rankings_text(db, day_num):
+    day = str(day_num)
+    
+    # Calculate the maximum possible races up to this day (Day 1=20, Day 2=40, etc.)
+    max_total_races = day_num * 20
+    
+    # 1. Gather Total Cumulative Data
+    total_stats_dict = {}
+    for d in range(1, day_num + 1):
+        d_str = str(d)
+        if d_str in db["days"]:
+            for uid, data in db["days"][d_str].items():
+                total_stats_dict[uid] = {
+                    "name": data["name"],
+                    "wins": data["wins"],
+                    "races": data["races"]
+                }
+
+    # 2. Gather Previous Day Cumulative Data
+    prev_stats_dict = {}
+    for d in range(1, day_num): 
+        d_str = str(d)
+        if d_str in db["days"]:
+            for uid, data in db["days"][d_str].items():
+                prev_stats_dict[uid] = {"wins": data["wins"], "races": data["races"]}
+
+    daily_stats = []
+    total_stats = []
+
+    # 3. Calculate Rates
+    for uid, total_data in total_stats_dict.items():
+        total_w, total_r = total_data["wins"], total_data["races"]
+        total_rate = (total_w / total_r * 100) if total_r > 0 else 0
+        total_stats.append({"name": total_data["name"], "wins": total_w, "races": total_r, "rate": total_rate})
+
+        prev_w = prev_stats_dict.get(uid, {}).get("wins", 0)
+        prev_r = prev_stats_dict.get(uid, {}).get("races", 0)
+        daily_w, daily_r = max(0, total_w - prev_w), max(0, total_r - prev_r)
+
+        if uid in db["days"].get(day, {}) or daily_r > 0:
+            daily_rate = (daily_w / daily_r * 100) if daily_r > 0 else 0
+            daily_stats.append({"name": total_data["name"], "wins": daily_w, "races": daily_r, "rate": daily_rate})
+
+    # 4. Format Strings
+    daily_stats.sort(key=lambda x: x["rate"], reverse=True)
+    total_stats.sort(key=lambda x: x["rate"], reverse=True)
+
+    cm_num = db.get("cm_number", "??")
+    cm_len = db.get("cm_length", "???m")
+    cm_surf = db.get("cm_surface", "???")
+    
+    # Build the daily message (Names are always just bold here)
+    overall_title = f"# **CM{cm_num} ({cm_len} {cm_surf}) - Day {day}**"
+    daily_msg = f"{overall_title}\n"
+    daily_title = f"### **Day {day}**"
+    daily_msg += f"{daily_title}\n"
+    if not daily_stats:
+        daily_msg += "No daily data found.\n"
+    else:
+        daily_msg += "\n".join([f"**{p['name']}** {p['rate']:.1f}% ({p['wins']}/{p['races']})" for p in daily_stats])
+    
+    # Build the total message (Check for missing races here)
+    total_title = f"### **Total (Up to Day {day})**"
+    total_msg = f"\n{total_title}\n"
+    if not total_stats:
+        total_msg += "No total data found.\n"
+    else:
+        total_lines = []
+        for p in total_stats:
+            # If they have fewer than the max possible races, make them Bold AND Italic
+            if p['races'] < max_total_races:
+                name_display = f"***{p['name']}***" 
+            else:
+                name_display = f"**{p['name']}**"
+                
+            total_lines.append(f"{name_display} {p['rate']:.1f}% ({p['wins']}/{p['races']})")
+            
+        total_msg += "\n".join(total_lines)
+    
+    return daily_msg + "\n" + total_msg
+
+@bot.event
+async def on_ready():
+    print(f'{bot.user} is now running!')
+
+@bot.command()
+async def calculate_day(ctx, day: str):
+    # --- NEW: Delete the user's command message silently ---
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass # Bot lacks permission, harmless to ignore
+
+    db = load_db()
+    
+    if "cm_start_date" not in db or not db["cm_start_date"]:
+        await ctx.send("Please set the event start date first.", delete_after=5)
+        return
+
+    try:
+        day_num = int(day)
+        if day_num < 1: raise ValueError
+    except ValueError:
+        await ctx.send("Please provide a valid day number.", delete_after=5)
+        return
+
+    base_start_time = datetime.strptime(db["cm_start_date"], "%Y-%m-%d").replace(
+        hour=22, minute=0, second=0, tzinfo=timezone.utc
+    )
+    day_start_time = base_start_time + timedelta(days=(day_num - 1))
+    day_end_time = day_start_time + timedelta(days=1)
+
+    channel = discord.utils.get(ctx.guild.channels, name="uma-musume")
+    if not channel:
+        return
+
+    # --- NEW: Send a temporary scanning message ---
+    scan_msg = await ctx.send(f"Scanning `uma-musume` for new Day {day} images...")
+
+    if day not in db["days"]:
+        db["days"][day] = {}
+
+    processed_count = 0
+
+    # Look how clean this is! Discord handles the time filtering for us, and we can remove the 'limit' entirely.
+    async for message in channel.history(limit=None, after=day_start_time, before=day_end_time):
+        
+        # Skip if we already processed this message
+        if message.id in db["processed_messages"]:
+            continue
+            
+        # Check if message has an image attachment
+        if message.attachments:
+            # We will do two passes over the attachments. 
+            # If any attachment succeeds on pass 1, we set force_parse=True for the rest.
+            valid_images_to_process = []
+            for attachment in message.attachments:
+                if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg']):
+                    valid_images_to_process.append(attachment)
+            
+            if not valid_images_to_process:
+                continue
+
+            # Flag to track if this Discord message contains at least one valid screenshot
+            message_contains_valid_screenshot = False
+            
+            for attachment in valid_images_to_process:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(attachment.url) as resp:
+                        if resp.status == 200:
+                            image_bytes = await resp.read()
+                            
+                            wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes, message_contains_valid_screenshot)
+                            
+                            if wins is not None and races is not None:
+                                message_contains_valid_screenshot = True 
+                                
+                                user_id = str(message.author.id)
+                                user_name = message.author.display_name
+                                
+                                if user_id not in db["days"][day]:
+                                    db["days"][day][user_id] = {"name": user_name, "wins": 0, "races": 0}
+                                    
+                                db["days"][day][user_id]["wins"] += wins
+                                db["days"][day][user_id]["races"] = max(db["days"][day][user_id]["races"], races)
+                                
+                                print(f"Processed image from {user_name}: {wins} wins, {races} races.")
+                            else:
+                                # --- DETAILED ERROR LOGGING ADDED HERE ---
+                                print(f"❌ OCR completely failed to parse all variations of: {attachment.filename}")
+                                print(f"   User: {message.author.display_name}")
+                                print(f"   Time: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
+                                print(f"   Message: '{message.content}'\n")
+
+            # Mark message as processed once attachments are handled
+            db["processed_messages"].append(message.id)
+            processed_count += 1
+
+        
+    save_db(db)
+
+    ranking_text = get_rankings_text(db, day_num)
+    
+    # --- NEW: Smart Message Editing Logic ---
+    if "day_msg_ids" not in db:
+        db["day_msg_ids"] = {}
+        
+    msg_id_to_edit = db["day_msg_ids"].get(day)
+    edited_successfully = False
+    
+    # Try to edit the existing message for this specific day
+    if msg_id_to_edit:
+        try:
+            msg = await ctx.channel.fetch_message(msg_id_to_edit)
+            await msg.edit(content=ranking_text)
+            edited_successfully = True
+        except discord.NotFound:
+            pass # The old message was manually deleted in Discord, so we will post a new one
+            
+    # If no message exists (or it was deleted), send a new one
+    if not edited_successfully:
+        sent_msg = await ctx.send(ranking_text)
+        db["day_msg_ids"][day] = sent_msg.id
+        db["last_ranking_msg_id"] = sent_msg.id # Keep for edit_score fallback
+        db["last_ranking_day"] = day_num
+        save_db(db)
+
+    # Clean up the temporary scanning message
+    try:
+        await scan_msg.delete()
+    except:
+        pass
+        
+    # Send a brief self-destructing confirmation
+    if processed_count == 0:
+        await ctx.send(f"Day {day} updated! (No new images found)", delete_after=3)
+    else:
+        await ctx.send(f"Day {day} updated! (Processed {processed_count} new images)", delete_after=5)
 
 
-def run_discord_bot():
-    TOKEN = os.getenv("TOKEN")
+@bot.command()
+async def set_cm_start(ctx, date_str: str, cm_number: int, length: str, surface: str):
+    """
+    Sets the start date of the CM. Automatically archives old data!
+    Usage: ~set_cm_start YYYY-MM-DD 11 3200m Turf
+    """
+    try:
+        valid_date = datetime.strptime(date_str, "%Y-%m-%d")
+        db = load_db()
+        
+        # --- NEW: Archive System ---
+        # If a CM was already running and we are starting a NEW one
+        if "cm_number" in db and db["cm_number"] != cm_number:
+            if "archive" not in db:
+                db["archive"] = {}
+                
+            old_num = str(db["cm_number"])
+            db["archive"][old_num] = {
+                "days": db.get("days", {}),
+                "processed_messages": db.get("processed_messages", []),
+                "cm_length": db.get("cm_length", "???m"),
+                "cm_surface": db.get("cm_surface", "???")
+            }
+            
+            # Wipe the slate clean for the new CM
+            db["days"] = {}
+            db["processed_messages"] = []
+            db["day_msg_ids"] = {}
+            db["last_ranking_msg_id"] = None
+            
+        # Set the new details
+        db["cm_start_date"] = date_str
+        db["cm_number"] = cm_number
+        db["cm_length"] = length
+        db["cm_surface"] = surface.capitalize()
+        
+        save_db(db)
+        
+        await ctx.send(f"CM{cm_number} ({length} {db['cm_surface']}) start date set to {date_str}.\n*(Old data was safely archived and the active leaderboard was wiped clean!)*")
+    except ValueError:
+        await ctx.send("Invalid format. Please use: `~set_cm_start YYYY-MM-DD <number> <length> <surface>`")
 
-    if not TOKEN:
-        raise ValueError("No token found! Make sure you have a .env file.")
+@bot.command()
+async def reset_cm_data(ctx):
+    """Emergency command to wipe the active leaderboard."""
+    db = load_db()
+    
+    # Reset all active tracking
+    db["days"] = {}
+    db["processed_messages"] = []
+    db["day_msg_ids"] = {}
+    db["last_ranking_msg_id"] = None
+    
+    save_db(db)
+    await ctx.send("Active leaderboard and scanned image memory have been completely wiped")
 
-    intents = discord.Intents.default()
-    intents.message_content = True
-    client = commands.Bot(command_prefix='~', intents=intents)
-    member_ids = [807685011213516811, 214197027829972995, 248090383018491904, 220722173810049034, 168950152847949824, 300752504050679820, 296585736248098816, 225930991833841664, 180180383357337602, 191688386413723648, 513616025699221514, 179367993581633536, 389511325736501269, 224620995602939906, 222429149426483200, 609083617955676161, 621993291772198922, 114142439912112130, 702862162925977671, 538178779902902273, 481741594832404490, 681269087078318318, 167176306117705728, 228706489647366144, 140395952753213440, 744739568074620978, 274968799009177600, 245733679807070209, 173258379207245824, 145097765725274112]
 
-    @client.event
-    async def on_ready():
-        print(f'{client.user} is now running!')
+@bot.command()
+async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
+    """
+    Manually fix a score. 
+    Usage: 
+    ~edit_score 1 123456789012345678 15 20  (By ID)
+    ~edit_score 1 @User 15 20               (By Mention)
+    ~edit_score 1 "User Name" 15 20         (By Name in quotes)
+    """
+    db = load_db()
 
-    @client.command()
-    async def test(ctx):
-        print(ctx.channel.id)
-        member = await ctx.guild.fetch_member(807685011213516811)
-        if member:
-            print(member.name)
-        else:
-            print("bruh")
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        print("Bot lacks 'Manage Messages' permission to delete the user's command.")
+    except Exception as e:
+        print(f"Error deleting message: {e}")
+    
+    # 1. Try to find the member
+    member = None
+    
+    # Try by ID or Mention
+    try:
+        # converter.MemberConverter handles mentions and IDs automatically
+        converter = commands.MemberConverter()
+        member = await converter.convert(ctx, user_input)
+    except commands.BadArgument:
+        # If that fails, search by name in the current guild
+        member = discord.utils.get(ctx.guild.members, name=user_input) or \
+                 discord.utils.get(ctx.guild.members, display_name=user_input)
 
-    @client.command()
-    async def changeRoles(ctx, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19,
-                          g20, g21, g22, g23, g24, g25, g26, g27, g28, g29, g30):
-        if ctx.channel.id == 929393229504331836:
-            groups = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14, g15, g16, g17, g18, g19, g20, g21,
-                      g22, g23, g24, g25, g26, g27, g28, g29, g30]
-            i = 0
-            for x in groups:
-                y = int(x)
-                if 18 >= y >= 1:
-                    role = get(ctx.guild.roles, name='Crimson Group ' + x)
-                    member = await ctx.guild.fetch_member(member_ids[i])
-                    print(member.name)
-                    if role not in member.roles:
-                        await member.add_roles(role)
-                    if ' Group ' not in member.display_name:
-                        if len(member.display_name) >= 25:
-                            zuViel = -abs(33 - len(member.display_name))
-                            await member.edit(nick=member.display_name[:zuViel])
-                            await member.edit(nick=member.display_name + ' Group ' + x)
-                        else:
-                            await member.edit(nick=member.display_name + ' Group ' + x)
-                else:
-                    await ctx.send("Role for Group " + x + "doesnt exist")
-                i = i + 1
-            await ctx.send("done")
+    if not member:
+        await ctx.send(f"❌ Could not find user '{user_input}'. Try using their User ID.")
+        return
 
-    @client.command()
-    async def removeRoles(ctx):
-        if ctx.channel.id == 929393229504331836:
-            i = 0
-            for x in member_ids:
-                member = await ctx.guild.fetch_member(member_ids[i])
-                for x in member.roles:
-                    if x.name[:13] == 'Crimson Group':
-                        await member.remove_roles(x)
-                if ' Group ' in member.display_name:
-                    await member.edit(nick=member.display_name[:-8])
-                i = i + 1
-            await ctx.send("done")
+    db = load_db()
+    day_num = int(day)
+    user_id = str(member.id)
+    
+    # Update data
+    if str(day_num) not in db["days"]: db["days"][str(day_num)] = {}
+    db["days"][str(day_num)][user_id] = {"name": member.name, "wins": wins, "races": races}
+    save_db(db)
 
-    client.run(TOKEN)
+    await ctx.send(f"Updated **{member.name}** to {wins}/{races}. Refreshing table...", delete_after=5)
+
+    # Auto-Edit the last ranking message
+    msg_id = db.get("day_msg_ids", {}).get(str(day_num)) or db.get("last_ranking_msg_id")
+    
+    if msg_id:
+        try:
+            updated_text = get_rankings_text(db, day_num)
+            msg = await ctx.channel.fetch_message(msg_id)
+            await msg.edit(content=updated_text)
+        except Exception as e:
+            await ctx.send(f"Score saved, but could not edit the ranking table: {e}", delete_after=5)
+
+
+
+@bot.command(name='help')
+async def help_command(ctx):
+    """Displays a beautiful custom help menu."""
+    
+    # We use a Discord Embed to make it look like an official UI panel
+    embed = discord.Embed(
+        title="Uma Musume CM Leaderboard Bot",
+        description="Welcome to the CM Leaderboard! Here is how to use my commands:",
+        color=discord.Color.green() # You can change this to .blue(), .red(), .gold(), etc.
+    )
+    
+    # 1. Set CM Start
+    embed.add_field(
+        name="`~set_cm_start <Date> <Number> <Length> <Surface>`",
+        value=(
+            "Initializes the Champions Meeting settings. **You must run this first!**\n"
+            "**Format:** `YYYY-MM-DD`\n"
+            "**Example:** `~set_cm_start 2026-03-30 11 3200m Turf`"
+        ),
+        inline=False
+    )
+    
+    # 2. Calculate Day
+    embed.add_field(
+        name="`~calculate_day <Day Number>`",
+        value=(
+            "Scans the `uma-musume` channel for all screenshots posted during that specific day. "
+            "It automatically extracts the wins/races and generates the leaderboard.\n"
+            "**Example:** `~calculate_day 1`"
+        ),
+        inline=False
+    )
+    
+    # 3. Edit Score
+    embed.add_field(
+        name="`~edit_score <Day> <User> <Wins> <Races>`",
+        value=(
+            "Manually fixes a score if the AI makes a mistake reading a screenshot. "
+            "Automatically updates the active leaderboard message without spamming the chat.\n"
+            "*(You can use a @mention, a User ID, or their \"Name in quotes\")*\n"
+            "**Example:** `~edit_score 1 @Zyf 18 20`"
+        ),
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+
+if __name__ == '__main__':
+    bot.run(TOKEN)
