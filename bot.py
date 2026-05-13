@@ -180,6 +180,126 @@ def get_rankings_text(db, day_num):
 async def on_ready():
     print(f'{bot.user} is now running!')
 
+@bot.event
+async def on_message(message):
+    # CRITICAL: Without this line, your bot will ignore all ~commands!
+    await bot.process_commands(message)
+
+    # Ignore messages sent by the bot itself
+    if message.author.bot:
+        return
+
+    # Only watch the uma-musume channel
+    if message.channel.name != "uma-musume":
+        return
+
+    # Check if there are attachments
+    if not message.attachments:
+        return
+
+    valid_images = [att for att in message.attachments if any(att.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg'])]
+    if not valid_images:
+        return
+
+    db = load_db()
+
+    # If the CM hasn't started yet, don't scan anything
+    if "cm_start_date" not in db or not db["cm_start_date"]:
+        return 
+
+    # --- Calculate which day this message belongs to ---
+    base_start_time = datetime.strptime(db["cm_start_date"], "%Y-%m-%d").replace(
+        hour=22, minute=0, second=0, tzinfo=timezone.utc
+    )
+    
+    # If the message is posted before the CM officially begins, ignore it
+    if message.created_at < base_start_time:
+        return
+        
+    delta = message.created_at - base_start_time
+    day_num = int(delta.total_seconds() // 86400) + 1
+    day_str = str(day_num)
+
+    # --- Process the image(s) ---
+    processed_any = False
+    message_contains_valid_screenshot = False
+
+    for attachment in valid_images:
+        # Add a magnifying glass reaction to show the bot is scanning
+        try: await message.add_reaction("🔍")
+        except: pass
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url) as resp:
+                if resp.status == 200:
+                    image_bytes = await resp.read()
+                    
+                    wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes, message_contains_valid_screenshot)
+                    
+                    if wins is not None and races is not None:
+                        message_contains_valid_screenshot = True
+                        processed_any = True
+                        
+                        user_id = str(message.author.id)
+                        user_name = message.author.display_name
+                        
+                        if day_str not in db["days"]:
+                            db["days"][day_str] = {}
+                            
+                        if user_id not in db["days"][day_str]:
+                            db["days"][day_str][user_id] = {"name": user_name, "wins": 0, "races": 0}
+                            
+                        db["days"][day_str][user_id]["wins"] += wins
+                        db["days"][day_str][user_id]["races"] = max(db["days"][day_str][user_id]["races"], races)
+                        
+                        print(f"Live processed image from {user_name}: {wins} wins, {races} races.")
+
+    # --- Update the Leaderboard ---
+    if processed_any:
+        db["processed_messages"].append(message.id)
+        
+        # Swap 🔍 for ✅
+        try:
+            await message.remove_reaction("🔍", bot.user)
+            await message.add_reaction("✅")
+        except: pass
+
+        # Generate fresh text
+        ranking_text = get_rankings_text(db, day_num)
+        
+        # Check if we already have a leaderboard message for this day
+        if "day_msg_ids" not in db:
+            db["day_msg_ids"] = {}
+            
+        msg_id_to_edit = db["day_msg_ids"].get(day_str)
+        
+        if msg_id_to_edit:
+            try:
+                msg = await message.channel.fetch_message(msg_id_to_edit)
+                await msg.edit(content=ranking_text)
+                save_db(db)
+            except discord.NotFound:
+                # If the old leaderboard was deleted, post a new one
+                sent_msg = await message.channel.send(ranking_text)
+                db["day_msg_ids"][day_str] = sent_msg.id
+                db["last_ranking_msg_id"] = sent_msg.id
+                db["last_ranking_day"] = day_num
+                save_db(db)
+        else:
+            # First image of the day! Post a brand new leaderboard
+            sent_msg = await message.channel.send(ranking_text)
+            db["day_msg_ids"][day_str] = sent_msg.id
+            db["last_ranking_msg_id"] = sent_msg.id
+            db["last_ranking_day"] = day_num
+            save_db(db)
+            
+    else:
+        # If it scanned the image but couldn't read the numbers, swap 🔍 for ❌
+        try:
+            await message.remove_reaction("🔍", bot.user)
+            await message.add_reaction("❌")
+        except: pass
+
 @bot.command()
 async def calculate_day(ctx, day: str):
     # --- NEW: Delete the user's command message silently ---
