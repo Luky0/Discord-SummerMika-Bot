@@ -19,6 +19,7 @@ if not TOKEN:
     raise ValueError("No token found! Make sure you have a .env file.")
 
 DB_FILE = "database.json"
+RANKING_CHANNEL_ID = 1408515039077466364
 
 client = OpenAI(
     api_key=os.getenv("CLOUDFLARE_API_KEY"),
@@ -79,7 +80,10 @@ def extract_data_from_image(image_bytes, force_parse=False):
         reply_text = response.choices[0].message.content
         
         # Quick regex to grab the JSON block in case Llama adds conversational text
-        json_match = re.search(r'\{.*?\}', reply_text, re.DOTALL)
+        if reply_text:
+            json_match = re.search(r'\{.*?\}', reply_text, re.DOTALL)
+        else:
+            json_match = None
         if json_match:
             data = json.loads(json_match.group(0))
             wins = data.get("wins", -1)
@@ -254,7 +258,7 @@ async def on_message(message):
                         
                         print(f"Live processed image from {user_name}: {wins} wins, {races} races.")
 
-    # --- Update the Leaderboard ---
+# --- Update the Leaderboard ---
     if processed_any:
         db["processed_messages"].append(message.id)
         
@@ -264,10 +268,18 @@ async def on_message(message):
             await message.add_reaction("✅")
         except: pass
 
-        # Generate fresh text
         ranking_text = get_rankings_text(db, day_num)
         
-        # Check if we already have a leaderboard message for this day
+        # Get the specific ranking channel
+        ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+        if not ranking_channel:
+            print("❌ Could not find the ranking channel!")
+            return
+
+        if not isinstance(ranking_channel, discord.TextChannel):
+            print("❌ Ranking channel is not a text channel!")
+            return
+
         if "day_msg_ids" not in db:
             db["day_msg_ids"] = {}
             
@@ -275,19 +287,20 @@ async def on_message(message):
         
         if msg_id_to_edit:
             try:
-                msg = await message.channel.fetch_message(msg_id_to_edit)
+                # Fetch from the ranking channel instead of the current channel
+                msg = await ranking_channel.fetch_message(msg_id_to_edit)
                 await msg.edit(content=ranking_text)
                 save_db(db)
             except discord.NotFound:
-                # If the old leaderboard was deleted, post a new one
-                sent_msg = await message.channel.send(ranking_text)
+                # If the old leaderboard was deleted, post a new one in the ranking channel
+                sent_msg = await ranking_channel.send(ranking_text)
                 db["day_msg_ids"][day_str] = sent_msg.id
                 db["last_ranking_msg_id"] = sent_msg.id
                 db["last_ranking_day"] = day_num
                 save_db(db)
         else:
-            # First image of the day! Post a brand new leaderboard
-            sent_msg = await message.channel.send(ranking_text)
+            # First image of the day! Post a brand new leaderboard in the ranking channel
+            sent_msg = await ranking_channel.send(ranking_text)
             db["day_msg_ids"][day_str] = sent_msg.id
             db["last_ranking_msg_id"] = sent_msg.id
             db["last_ranking_day"] = day_num
@@ -384,7 +397,7 @@ async def calculate_day(ctx, day: str):
                                 print(f"Processed image from {user_name}: {wins} wins, {races} races.")
                             else:
                                 # --- DETAILED ERROR LOGGING ADDED HERE ---
-                                print(f"❌ OCR completely failed to parse all variations of: {attachment.filename}")
+                                print(f"   OCR completely failed to parse all variations of: {attachment.filename}")
                                 print(f"   User: {message.author.display_name}")
                                 print(f"   Time: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
                                 print(f"   Message: '{message.content}'\n")
