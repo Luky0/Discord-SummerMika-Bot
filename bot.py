@@ -36,8 +36,12 @@ bot.remove_command('help')
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return {"processed_messages": [], "days": {}}
+            db = json.load(f)
+            # Ensure the custom_names dictionary exists in older databases
+            if "custom_names" not in db:
+                db["custom_names"] = {}
+            return db
+    return {"processed_messages": [], "days": {}, "custom_names": {}}
 
 def save_db(data):
     with open(DB_FILE, 'w') as f:
@@ -107,12 +111,17 @@ def get_rankings_text(db, day_num):
     
     # 1. Gather Total Cumulative Data
     total_stats_dict = {}
+    custom_names = db.get("custom_names", {}) # Load the custom names map
+    
     for d in range(1, day_num + 1):
         d_str = str(d)
         if d_str in db["days"]:
             for uid, data in db["days"][d_str].items():
+                # OVERRIDE: Check if this user has a custom name; if not, use their Discord name
+                display_name = custom_names.get(uid, data["name"])
+                
                 total_stats_dict[uid] = {
-                    "name": data["name"],
+                    "name": display_name,
                     "wins": data["wins"],
                     "races": data["races"]
                 }
@@ -502,7 +511,7 @@ async def reset_cm_data(ctx):
     db["last_ranking_msg_id"] = None
     
     save_db(db)
-    await ctx.send("Active leaderboard and scanned image memory have been completely wiped")
+    await ctx.send("Active leaderboard and scanned image memory have been completely wiped", delete_after=5)
 
 
 @bot.command()
@@ -544,23 +553,94 @@ async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
     day_num = int(day)
     user_id = str(member.id)
     
-    # Update data
+   # Update data
     if str(day_num) not in db["days"]: db["days"][str(day_num)] = {}
-    db["days"][str(day_num)][user_id] = {"name": member.name, "wins": wins, "races": races}
+    db["days"][str(day_num)][user_id] = {"name": member.display_name, "wins": wins, "races": races}
     save_db(db)
 
-    await ctx.send(f"Updated **{member.name}** to {wins}/{races}. Refreshing table...", delete_after=5)
+    await ctx.send(f"Updated **{member.display_name}** to {wins}/{races}. Refreshing table...", delete_after=5)
 
-    # Auto-Edit the last ranking message
+    # --- AUTO-EDIT THE SPECIFIC DAY'S MESSAGE ---
     msg_id = db.get("day_msg_ids", {}).get(str(day_num)) or db.get("last_ranking_msg_id")
+    ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
     
-    if msg_id:
-        try:
-            updated_text = get_rankings_text(db, day_num)
-            msg = await ctx.channel.fetch_message(msg_id)
-            await msg.edit(content=updated_text)
-        except Exception as e:
-            await ctx.send(f"Score saved, but could not edit the ranking table: {e}", delete_after=5)
+    if ranking_channel and isinstance(ranking_channel, discord.TextChannel):
+        updated_text = get_rankings_text(db, day_num)
+        edited_successfully = False
+
+        if msg_id:
+            try:
+                # Try to fetch and edit the existing message
+                msg = await ranking_channel.fetch_message(msg_id)
+                await msg.edit(content=updated_text)
+                edited_successfully = True
+            except discord.NotFound:
+                # 404 Error: The message was deleted or is in the old channel!
+                pass 
+            except Exception as e:
+                await ctx.send(f"Score saved, but could not edit the ranking table: {e}", delete_after=5)
+                edited_successfully = True # Prevent it from posting a new one on a random API error
+
+        # If the old message couldn't be found (404), post a brand new one!
+        if not edited_successfully:
+            sent_msg = await ranking_channel.send(updated_text)
+            
+            # Update the database with the NEW message ID
+            if "day_msg_ids" not in db: 
+                db["day_msg_ids"] = {}
+                
+            db["day_msg_ids"][str(day_num)] = sent_msg.id
+            db["last_ranking_msg_id"] = sent_msg.id
+            save_db(db)
+
+
+@bot.command()
+async def set_name(ctx, user_input: str, *, custom_name: str):
+    """
+    Sets a permanent custom leaderboard name for a user.
+    Usage: ~set_name @User Cool Name
+    """
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+
+    db = load_db()
+    
+    # 1. Try to find the member
+    member = None
+    try:
+        converter = commands.MemberConverter()
+        member = await converter.convert(ctx, user_input)
+    except commands.BadArgument:
+        member = discord.utils.get(ctx.guild.members, name=user_input) or \
+                 discord.utils.get(ctx.guild.members, display_name=user_input)
+
+    if not member:
+        await ctx.send(f"Could not find user '{user_input}'. Try using their User ID.", delete_after=5)
+        return
+
+    user_id = str(member.id)
+    
+    # Save the custom name
+    db["custom_names"][user_id] = custom_name
+    save_db(db)
+
+    await ctx.send(f"**{member.display_name}** will now be shown as **{custom_name}** on the leaderboard.", delete_after=5)
+
+    # --- AUTO-REFRESH THE LEADERBOARD ---
+    day_num = db.get("last_ranking_day")
+    if day_num:
+        msg_id = db.get("day_msg_ids", {}).get(str(day_num))
+        ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+        
+        if msg_id and ranking_channel and isinstance(ranking_channel, discord.TextChannel):
+            try:
+                updated_text = get_rankings_text(db, day_num)
+                msg = await ranking_channel.fetch_message(msg_id)
+                await msg.edit(content=updated_text)
+            except:
+                pass
 
 
 
@@ -605,6 +685,16 @@ async def help_command(ctx):
             "Automatically updates the active leaderboard message without spamming the chat.\n"
             "*(You can use a @mention, a User ID, or their \"Name in quotes\")*\n"
             "**Example:** `~edit_score 1 @Zyf 18 20`"
+        ),
+        inline=False
+    )
+
+    # 4. Set Custom Name
+    embed.add_field(
+        name="`~set_name <User> <Custom Name>`",
+        value=(
+            "Forces the leaderboard to use a specific name for a user instead of their Discord nickname.\n"
+            "**Example:** `~set_name @Zyf Uma Master`"
         ),
         inline=False
     )
