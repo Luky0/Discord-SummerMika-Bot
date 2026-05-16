@@ -642,6 +642,22 @@ async def set_name(ctx, user_input: str, *, custom_name: str):
             except:
                 pass
 
+@bot.command()
+async def unlink_day(ctx, day: str):
+    """Makes the bot forget the old message ID so it creates a new leaderboard."""
+    try: 
+        await ctx.message.delete()
+    except: 
+        pass
+
+    db = load_db()
+    if "day_msg_ids" in db and day in db["day_msg_ids"]:
+        del db["day_msg_ids"][day]
+        save_db(db)
+        await ctx.send(f"🔗 Unlinked the old message for Day {day}! The next update will post a brand new leaderboard.", delete_after=5)
+    else:
+        await ctx.send(f"⚠️ No message ID found for Day {day}.", delete_after=5)
+
 
 
 @bot.command(name='help')
