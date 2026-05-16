@@ -18,7 +18,11 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise ValueError("No token found! Make sure you have a .env file.")
 
-DB_FILE = "database.json"
+# Check if the safe Railway volume exists
+if os.path.exists("/app/data"):
+    DB_FILE = "/app/data/database.json"
+else:
+    DB_FILE = "database.json" # Fallback for testing on your PC
 RANKING_CHANNEL_ID = 1408515039077466364
 
 client = OpenAI(
