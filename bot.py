@@ -561,7 +561,7 @@ async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
     await ctx.send(f"Updated **{member.display_name}** to {wins}/{races}. Refreshing table...", delete_after=5)
 
     # --- AUTO-EDIT THE SPECIFIC DAY'S MESSAGE ---
-    msg_id = db.get("day_msg_ids", {}).get(str(day_num)) or db.get("last_ranking_msg_id")
+    msg_id = db.get("day_msg_ids", {}).get(str(day_num))
     ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
     
     if ranking_channel and isinstance(ranking_channel, discord.TextChannel):
