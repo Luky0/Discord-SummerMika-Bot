@@ -82,8 +82,59 @@ def apply_reading(db, day_str, user_id, user_name, wins, races):
     if entry is None or races >= entry["races"]:
         db["days"][day_str][user_id] = {"name": user_name, "wins": wins, "races": races}
 
+# Possible results of reading a screenshot
+SCAN_OK = "ok"                  # A CM result with readable wins/races
+SCAN_NOT_RESULT = "not_result"  # Meme, character build, etc. -> silently ignored
+SCAN_UNREADABLE = "unreadable"  # Looked like a CM result, but the numbers made no sense (or the API failed)
+
+CM_PROMPT = (
+    "This image is the lower part of a screenshot posted in an Uma Musume Discord chat. "
+    "Most images posted there are memes, character builds, gacha pulls or other screenshots that are NOT what we want.\n"
+    "We only want the Champions Meeting result screen that shows the player's number of '1st place' finishes "
+    "and their number of 'Races'.\n"
+    "If the image does not clearly show BOTH of these labelled numbers, reply exactly: {\"is_cm_result\": false}\n"
+    "Never guess, estimate or calculate numbers that are not printed next to those labels.\n"
+    "If it does show them, reply exactly like this: {\"is_cm_result\": true, \"wins\": 15, \"races\": 40}\n"
+    "Reply with ONLY the JSON object."
+)
+
+def _as_int(value):
+    """Accepts 15 or "15" from the AI, everything else becomes None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+def parse_ai_reply(reply_text):
+    """Turns the AI's answer into (status, wins, races)."""
+    # Quick regex to grab the JSON block in case the AI adds conversational text
+    json_match = re.search(r'\{.*?\}', reply_text or "", re.DOTALL)
+    if not json_match:
+        return SCAN_UNREADABLE, None, None
+
+    try:
+        data = json.loads(json_match.group(0))
+    except json.JSONDecodeError:
+        return SCAN_UNREADABLE, None, None
+
+    if data.get("is_cm_result") is not True:
+        return SCAN_NOT_RESULT, None, None
+
+    wins = _as_int(data.get("wins"))
+    races = _as_int(data.get("races"))
+
+    # Basic sanity check: races come in steps of 5 and you can't win more than you raced
+    if wins is not None and races is not None:
+        if 5 <= races <= 80 and races % 5 == 0 and 0 <= wins <= races:
+            return SCAN_OK, wins, races
+
+    return SCAN_UNREADABLE, None, None
+
 def extract_data_from_image(image_bytes):
-    """Uses Cloudflare's free Llama 3.2 Vision model."""
+    """Asks the Cloudflare vision model if this is a CM result and reads wins/races. Returns (status, wins, races)."""
     try:
         original_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
         
@@ -108,35 +159,45 @@ def extract_data_from_image(image_bytes):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Find the '1st place' wins and 'Races' from this game result. Return ONLY a JSON object exactly like this: {\"wins\": 15, \"races\": 40}"},
+                        {"type": "text", "text": CM_PROMPT},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                     ]
                 }
-            ]
+            ],
+            temperature=0 # Always give the most likely answer instead of a creative one
         )
-        
-        # Parse the JSON from the AI's reply
+
         reply_text = response.choices[0].message.content
-        
-        # Quick regex to grab the JSON block in case Llama adds conversational text
-        if reply_text:
-            json_match = re.search(r'\{.*?\}', reply_text, re.DOTALL)
-        else:
-            json_match = None
-        if json_match:
-            data = json.loads(json_match.group(0))
-            wins = data.get("wins", -1)
-            races = data.get("races", -1)
-            
-            # Use our bulletproof modulo 5 math check!
-            if isinstance(wins, int) and isinstance(races, int):
-                if 5 <= races <= 80 and races % 5 == 0 and wins <= races:
-                    return wins, races
-                    
+        status, wins, races = parse_ai_reply(reply_text)
+        if status != SCAN_OK:
+            print(f"   AI reply ({status}): {reply_text!r}")
+        return status, wins, races
+
     except Exception as e:
         print(f"Cloudflare Vision API Error: {e}")
-        
-    return None, None
+
+    return SCAN_UNREADABLE, None, None
+
+def check_plausible(db, day_num, user_id, wins, races):
+    """
+    Compares a reading with what the player could possibly have. Returns None if it's fine,
+    otherwise a short reason why it was rejected.
+    """
+    # Each day allows at most 20 races
+    if races > day_num * 20:
+        return f"{races} races is more than possible by day {day_num} ({day_num * 20})"
+
+    # Screenshots show running totals, so they can't be lower than an earlier day's total
+    for d in range(day_num - 1, 0, -1):
+        prev = db["days"].get(str(d), {}).get(user_id)
+        if prev:
+            if races < prev["races"] or wins < prev["wins"]:
+                return f"{wins}/{races} is lower than day {d}'s total of {prev['wins']}/{prev['races']}"
+            if wins - prev["wins"] > races - prev["races"]:
+                return f"{wins}/{races} means more new wins than new races since day {d} ({prev['wins']}/{prev['races']})"
+            break
+
+    return None
 
 def get_rankings_text(db, day_num):
     day = str(day_num)
@@ -280,85 +341,99 @@ async def on_message(message):
     # --- Process the image(s) ---
     # The slow AI calls happen before taking the lock, so other posts aren't blocked meanwhile
     readings = []
+    saw_unreadable = False
+
+    # Add a magnifying glass reaction to show the bot is scanning
+    try: await message.add_reaction("🔍")
+    except: pass
 
     for attachment in valid_images:
-        # Add a magnifying glass reaction to show the bot is scanning
-        try: await message.add_reaction("🔍")
-        except: pass
-
         async with aiohttp.ClientSession() as session:
             async with session.get(attachment.url) as resp:
                 if resp.status == 200:
                     image_bytes = await resp.read()
 
-                    wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+                    status, wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
 
-                    if wins is not None and races is not None:
+                    if status == SCAN_OK:
                         readings.append((wins, races))
                         print(f"Live processed image from {message.author.display_name}: {wins} wins, {races} races.")
+                    elif status == SCAN_UNREADABLE:
+                        saw_unreadable = True
+
+    try: await message.remove_reaction("🔍", bot.user)
+    except: pass
+
+    # Memes, character builds etc. are ignored without any reaction, so normal chatting isn't cluttered.
+    # ❌ is only for images that looked like a CM result but couldn't be read or didn't add up.
+    if not readings:
+        if saw_unreadable:
+            try: await message.add_reaction("❌")
+            except: pass
+        return
 
 # --- Update the Leaderboard ---
-    if readings:
-        # Swap 🔍 for ✅
-        try:
-            await message.remove_reaction("🔍", bot.user)
-            await message.add_reaction("✅")
+    async with db_lock:
+        # Reload inside the lock so we build on any results saved while we were scanning
+        db = load_db()
+
+        user_id = str(message.author.id)
+        accepted_any = False
+        for wins, races in readings:
+            reason = check_plausible(db, day_num, user_id, wins, races)
+            if reason:
+                print(f"Rejected reading from {message.author.display_name}: {reason}")
+                continue
+            apply_reading(db, day_str, user_id, message.author.display_name, wins, races)
+            accepted_any = True
+
+        if not accepted_any:
+            try: await message.add_reaction("❌")
+            except: pass
+            return
+
+        try: await message.add_reaction("✅")
         except: pass
 
-        async with db_lock:
-            # Reload inside the lock so we build on any results saved while we were scanning
-            db = load_db()
+        db["processed_messages"].append(message.id)
+        save_db(db)
 
-            user_id = str(message.author.id)
-            for wins, races in readings:
-                apply_reading(db, day_str, user_id, message.author.display_name, wins, races)
+        ranking_text = get_rankings_text(db, day_num)
 
-            db["processed_messages"].append(message.id)
-            save_db(db)
+        # Get the specific ranking channel
+        ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+        if not ranking_channel:
+            print("❌ Could not find the ranking channel!")
+            return
 
-            ranking_text = get_rankings_text(db, day_num)
+        if not isinstance(ranking_channel, discord.TextChannel):
+            print("❌ Ranking channel is not a text channel!")
+            return
 
-            # Get the specific ranking channel
-            ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
-            if not ranking_channel:
-                print("❌ Could not find the ranking channel!")
-                return
+        if "day_msg_ids" not in db:
+            db["day_msg_ids"] = {}
 
-            if not isinstance(ranking_channel, discord.TextChannel):
-                print("❌ Ranking channel is not a text channel!")
-                return
+        msg_id_to_edit = db["day_msg_ids"].get(day_str)
 
-            if "day_msg_ids" not in db:
-                db["day_msg_ids"] = {}
-
-            msg_id_to_edit = db["day_msg_ids"].get(day_str)
-
-            if msg_id_to_edit:
-                try:
-                    # Fetch from the ranking channel instead of the current channel
-                    msg = await ranking_channel.fetch_message(msg_id_to_edit)
-                    await msg.edit(content=ranking_text)
-                except discord.NotFound:
-                    # If the old leaderboard was deleted, post a new one in the ranking channel
-                    sent_msg = await ranking_channel.send(ranking_text)
-                    db["day_msg_ids"][day_str] = sent_msg.id
-                    db["last_ranking_msg_id"] = sent_msg.id
-                    db["last_ranking_day"] = day_num
-                    save_db(db)
-            else:
-                # First image of the day! Post a brand new leaderboard in the ranking channel
+        if msg_id_to_edit:
+            try:
+                # Fetch from the ranking channel instead of the current channel
+                msg = await ranking_channel.fetch_message(msg_id_to_edit)
+                await msg.edit(content=ranking_text)
+            except discord.NotFound:
+                # If the old leaderboard was deleted, post a new one in the ranking channel
                 sent_msg = await ranking_channel.send(ranking_text)
                 db["day_msg_ids"][day_str] = sent_msg.id
                 db["last_ranking_msg_id"] = sent_msg.id
                 db["last_ranking_day"] = day_num
                 save_db(db)
-
-    else:
-        # If it scanned the image but couldn't read the numbers, swap 🔍 for ❌
-        try:
-            await message.remove_reaction("🔍", bot.user)
-            await message.add_reaction("❌")
-        except: pass
+        else:
+            # First image of the day! Post a brand new leaderboard in the ranking channel
+            sent_msg = await ranking_channel.send(ranking_text)
+            db["day_msg_ids"][day_str] = sent_msg.id
+            db["last_ranking_msg_id"] = sent_msg.id
+            db["last_ranking_day"] = day_num
+            save_db(db)
 
 # Every command first defers (shows "Bot is thinking...") and only then waits for db_lock,
 # because Discord cancels a command that hasn't answered within 3 seconds.
@@ -419,15 +494,18 @@ async def calculate_day(interaction: discord.Interaction, day: app_commands.Rang
                             if resp.status == 200:
                                 image_bytes = await resp.read()
 
-                                wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+                                status, wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+                                user_name = message.author.display_name
 
-                                if wins is not None and races is not None:
-                                    user_name = message.author.display_name
-                                    apply_reading(db, day, str(message.author.id), user_name, wins, races)
-
-                                    print(f"Processed image from {user_name}: {wins} wins, {races} races.")
-                                else:
-                                    print(f"   OCR completely failed to parse all variations of: {attachment.filename}")
+                                if status == SCAN_OK:
+                                    reason = check_plausible(db, day_num, str(message.author.id), wins, races)
+                                    if reason:
+                                        print(f"Rejected reading from {user_name}: {reason}")
+                                    else:
+                                        apply_reading(db, day, str(message.author.id), user_name, wins, races)
+                                        print(f"Processed image from {user_name}: {wins} wins, {races} races.")
+                                elif status == SCAN_UNREADABLE:
+                                    print(f"   Could not read the CM result in: {attachment.filename}")
                                     print(f"   User: {message.author.display_name}")
                                     print(f"   Time: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
                                     print(f"   Message: '{message.content}'\n")
