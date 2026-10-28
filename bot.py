@@ -1,16 +1,16 @@
 import os
 import json
 import discord
-from discord.ext import commands
+from discord import app_commands
 import aiohttp
 from PIL import Image
 import io
 import re
 from datetime import datetime, timezone, timedelta
+from typing import Literal
 from dotenv import load_dotenv
 import asyncio
 import base64
-import functools
 from openai import OpenAI
 
 load_dotenv("secrets.env")
@@ -34,24 +34,27 @@ client = OpenAI(
 # Initialize intents and bot
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='~', intents=intents)
 
-bot.remove_command('help')
+class LeaderboardBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        # The command tree holds all the /slash commands
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # Register the /commands with Discord so they show up while typing
+        synced = await self.tree.sync()
+        print(f"Synced {len(synced)} slash commands.")
+
+bot = LeaderboardBot()
 
 # Only one handler may load -> modify -> save the database at a time,
 # otherwise two screenshots posted at once overwrite each other's results
 db_lock = asyncio.Lock()
 
-def with_db_lock(func):
-    """Runs a command while holding db_lock."""
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        async with db_lock:
-            return await func(*args, **kwargs)
-    return wrapper
-
-# Commands that change the leaderboard need "Manage Messages" permission
-admin_only = commands.has_permissions(manage_messages=True)
+# Commands that change the leaderboard are only shown to members with "Manage Messages".
+# Server admins can change who sees them under Server Settings -> Integrations.
+admin_only = app_commands.default_permissions(manage_messages=True)
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -226,20 +229,19 @@ def get_rankings_text(db, day_num):
 async def on_ready():
     print(f'{bot.user} is now running!')
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("You need the **Manage Messages** permission to use this command.", delete_after=5)
-    elif isinstance(error, commands.CommandNotFound):
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"Error in command '/{interaction.command.name if interaction.command else '?'}': {error}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something went wrong while running this command.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Something went wrong while running this command.", ephemeral=True)
+    except discord.HTTPException:
         pass
-    else:
-        print(f"Error in command '{ctx.command}': {error}")
 
 @bot.event
 async def on_message(message):
-    # CRITICAL: Without this line, your bot will ignore all ~commands!
-    await bot.process_commands(message)
-
     # Ignore messages sent by the bot itself
     if message.author.bot:
         return
@@ -260,17 +262,17 @@ async def on_message(message):
 
     # If the CM hasn't started yet, don't scan anything
     if "cm_start_date" not in db or not db["cm_start_date"]:
-        return 
+        return
 
     # --- Calculate which day this message belongs to ---
     base_start_time = datetime.strptime(db["cm_start_date"], "%Y-%m-%d").replace(
         hour=22, minute=0, second=0, tzinfo=timezone.utc
     )
-    
+
     # If the message is posted before the CM officially begins, ignore it
     if message.created_at < base_start_time:
         return
-        
+
     delta = message.created_at - base_start_time
     day_num = int(delta.total_seconds() // 86400) + 1
     day_str = str(day_num)
@@ -358,154 +360,146 @@ async def on_message(message):
             await message.add_reaction("❌")
         except: pass
 
-@bot.command()
-@with_db_lock
-async def calculate_day(ctx, day: str):
-    # --- NEW: Delete the user's command message silently ---
-    try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        pass # Bot lacks permission, harmless to ignore
+# Every command first defers (shows "Bot is thinking...") and only then waits for db_lock,
+# because Discord cancels a command that hasn't answered within 3 seconds.
+# Replies marked ephemeral are only visible to the person who used the command.
 
-    db = load_db()
-    
-    if "cm_start_date" not in db or not db["cm_start_date"]:
-        await ctx.send("Please set the event start date first.", delete_after=5)
-        return
+@bot.tree.command(name="calculate_day", description="Scan the uma-musume channel for a day's screenshots and update its leaderboard")
+@app_commands.describe(day="The CM day to scan (1, 2, 3, ...)")
+@app_commands.guild_only()
+async def calculate_day(interaction: discord.Interaction, day: app_commands.Range[int, 1]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    try:
-        day_num = int(day)
-        if day_num < 1: raise ValueError
-    except ValueError:
-        await ctx.send("Please provide a valid day number.", delete_after=5)
-        return
+    async with db_lock:
+        db = load_db()
 
-    base_start_time = datetime.strptime(db["cm_start_date"], "%Y-%m-%d").replace(
-        hour=22, minute=0, second=0, tzinfo=timezone.utc
-    )
-    day_start_time = base_start_time + timedelta(days=(day_num - 1))
-    day_end_time = day_start_time + timedelta(days=1)
+        if "cm_start_date" not in db or not db["cm_start_date"]:
+            await interaction.followup.send("Please set the event start date first.", ephemeral=True)
+            return
 
-    channel = discord.utils.get(ctx.guild.channels, name="uma-musume")
-    if not channel:
-        return
+        day_num = day
+        day = str(day_num)
 
-    # --- NEW: Send a temporary scanning message ---
-    scan_msg = await ctx.send(f"Scanning `uma-musume` for new Day {day} images...")
+        base_start_time = datetime.strptime(db["cm_start_date"], "%Y-%m-%d").replace(
+            hour=22, minute=0, second=0, tzinfo=timezone.utc
+        )
+        day_start_time = base_start_time + timedelta(days=(day_num - 1))
+        day_end_time = day_start_time + timedelta(days=1)
 
-    if day not in db["days"]:
-        db["days"][day] = {}
+        channel = discord.utils.get(interaction.guild.channels, name="uma-musume")
+        if not channel:
+            await interaction.followup.send("Could not find the `uma-musume` channel.", ephemeral=True)
+            return
 
-    processed_count = 0
+        if day not in db["days"]:
+            db["days"][day] = {}
 
-    # Look how clean this is! Discord handles the time filtering for us, and we can remove the 'limit' entirely.
-    async for message in channel.history(limit=None, after=day_start_time, before=day_end_time):
-        
-        # Skip if we already processed this message
-        if message.id in db["processed_messages"]:
-            continue
-            
-        # Check if message has an image attachment
-        if message.attachments:
-            # We will do two passes over the attachments. 
-            # If any attachment succeeds on pass 1, we set force_parse=True for the rest.
-            valid_images_to_process = []
-            for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg']):
-                    valid_images_to_process.append(attachment)
-            
-            if not valid_images_to_process:
+        processed_count = 0
+
+        # Discord handles the time filtering for us, so no 'limit' is needed
+        async for message in channel.history(limit=None, after=day_start_time, before=day_end_time):
+
+            # Skip if we already processed this message
+            if message.id in db["processed_messages"]:
                 continue
 
-            for attachment in valid_images_to_process:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(attachment.url) as resp:
-                        if resp.status == 200:
-                            image_bytes = await resp.read()
-                            
-                            wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+            # Check if message has an image attachment
+            if message.attachments:
+                valid_images_to_process = []
+                for attachment in message.attachments:
+                    if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg']):
+                        valid_images_to_process.append(attachment)
 
-                            if wins is not None and races is not None:
-                                user_name = message.author.display_name
-                                apply_reading(db, day, str(message.author.id), user_name, wins, races)
+                if not valid_images_to_process:
+                    continue
 
-                                print(f"Processed image from {user_name}: {wins} wins, {races} races.")
-                            else:
-                                # --- DETAILED ERROR LOGGING ADDED HERE ---
-                                print(f"   OCR completely failed to parse all variations of: {attachment.filename}")
-                                print(f"   User: {message.author.display_name}")
-                                print(f"   Time: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
-                                print(f"   Message: '{message.content}'\n")
+                for attachment in valid_images_to_process:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment.url) as resp:
+                            if resp.status == 200:
+                                image_bytes = await resp.read()
 
-            # Mark message as processed once attachments are handled
-            db["processed_messages"].append(message.id)
-            processed_count += 1
+                                wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
 
-        
-    save_db(db)
+                                if wins is not None and races is not None:
+                                    user_name = message.author.display_name
+                                    apply_reading(db, day, str(message.author.id), user_name, wins, races)
 
-    ranking_text = get_rankings_text(db, day_num)
-    
-    # --- NEW: Smart Message Editing Logic ---
-    if "day_msg_ids" not in db:
-        db["day_msg_ids"] = {}
-        
-    msg_id_to_edit = db["day_msg_ids"].get(day)
-    edited_successfully = False
+                                    print(f"Processed image from {user_name}: {wins} wins, {races} races.")
+                                else:
+                                    print(f"   OCR completely failed to parse all variations of: {attachment.filename}")
+                                    print(f"   User: {message.author.display_name}")
+                                    print(f"   Time: {message.created_at.strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
+                                    print(f"   Message: '{message.content}'\n")
 
-    # Always use the ranking channel, no matter where the command was typed
-    ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
-    if not isinstance(ranking_channel, discord.TextChannel):
-        ranking_channel = ctx.channel
+                # Mark message as processed once attachments are handled
+                db["processed_messages"].append(message.id)
+                processed_count += 1
 
-    # Try to edit the existing message for this specific day
-    if msg_id_to_edit:
-        try:
-            msg = await ranking_channel.fetch_message(msg_id_to_edit)
-            await msg.edit(content=ranking_text)
-            edited_successfully = True
-        except discord.NotFound:
-            pass # The old message was manually deleted in Discord, so we will post a new one
-
-    # If no message exists (or it was deleted), send a new one
-    if not edited_successfully:
-        sent_msg = await ranking_channel.send(ranking_text)
-        db["day_msg_ids"][day] = sent_msg.id
-        db["last_ranking_msg_id"] = sent_msg.id # Keep for edit_score fallback
-        db["last_ranking_day"] = day_num
         save_db(db)
 
-    # Clean up the temporary scanning message
-    try:
-        await scan_msg.delete()
-    except:
-        pass
-        
-    # Send a brief self-destructing confirmation
+        ranking_text = get_rankings_text(db, day_num)
+
+        if "day_msg_ids" not in db:
+            db["day_msg_ids"] = {}
+
+        msg_id_to_edit = db["day_msg_ids"].get(day)
+        edited_successfully = False
+
+        # Always use the ranking channel, no matter where the command was typed
+        ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+        if not isinstance(ranking_channel, discord.TextChannel):
+            ranking_channel = interaction.channel
+
+        # Try to edit the existing message for this specific day
+        if msg_id_to_edit:
+            try:
+                msg = await ranking_channel.fetch_message(msg_id_to_edit)
+                await msg.edit(content=ranking_text)
+                edited_successfully = True
+            except discord.NotFound:
+                pass # The old message was manually deleted in Discord, so we will post a new one
+
+        # If no message exists (or it was deleted), send a new one
+        if not edited_successfully:
+            sent_msg = await ranking_channel.send(ranking_text)
+            db["day_msg_ids"][day] = sent_msg.id
+            db["last_ranking_msg_id"] = sent_msg.id # Keep for edit_score fallback
+            db["last_ranking_day"] = day_num
+            save_db(db)
+
     if processed_count == 0:
-        await ctx.send(f"Day {day} updated! (No new images found)", delete_after=3)
+        await interaction.followup.send(f"Day {day} updated! (No new images found)", ephemeral=True)
     else:
-        await ctx.send(f"Day {day} updated! (Processed {processed_count} new images)", delete_after=5)
+        await interaction.followup.send(f"Day {day} updated! (Processed {processed_count} new images)", ephemeral=True)
 
 
-@bot.command()
+@bot.tree.command(name="set_cm_start", description="Start a new Champions Meeting (archives the old one)")
+@app_commands.describe(
+    date="Start date of the CM in the format YYYY-MM-DD, e.g. 2026-03-30",
+    cm_number="Number of the CM, e.g. 11",
+    length="Race length, e.g. 3200m",
+    surface="Track surface",
+)
+@app_commands.guild_only()
 @admin_only
-@with_db_lock
-async def set_cm_start(ctx, date_str: str, cm_number: int, length: str, surface: str):
-    """
-    Sets the start date of the CM. Automatically archives old data!
-    Usage: ~set_cm_start YYYY-MM-DD 11 3200m Turf
-    """
+async def set_cm_start(interaction: discord.Interaction, date: str, cm_number: int, length: str, surface: Literal["Turf", "Dirt"]):
+    await interaction.response.defer(thinking=True)
+
     try:
-        valid_date = datetime.strptime(date_str, "%Y-%m-%d")
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        await interaction.followup.send("Invalid date. Please use the format `YYYY-MM-DD`, e.g. `2026-03-30`.")
+        return
+
+    async with db_lock:
         db = load_db()
-        
-        # --- NEW: Archive System ---
-        # If a CM was already running and we are starting a NEW one
+
+        # If a CM was already running and we are starting a NEW one, archive it
         if "cm_number" in db and db["cm_number"] != cm_number:
             if "archive" not in db:
                 db["archive"] = {}
-                
+
             old_num = str(db["cm_number"])
             db["archive"][old_num] = {
                 "days": db.get("days", {}),
@@ -513,250 +507,207 @@ async def set_cm_start(ctx, date_str: str, cm_number: int, length: str, surface:
                 "cm_length": db.get("cm_length", "???m"),
                 "cm_surface": db.get("cm_surface", "???")
             }
-            
+
             # Wipe the slate clean for the new CM
             db["days"] = {}
             db["processed_messages"] = []
             db["day_msg_ids"] = {}
             db["last_ranking_msg_id"] = None
-            
+
         # Set the new details
-        db["cm_start_date"] = date_str
+        db["cm_start_date"] = date
         db["cm_number"] = cm_number
         db["cm_length"] = length
-        db["cm_surface"] = surface.capitalize()
-        
+        db["cm_surface"] = surface
+
         save_db(db)
-        
-        await ctx.send(f"CM{cm_number} ({length} {db['cm_surface']}) start date set to {date_str}.\n*(Old data was safely archived and the active leaderboard was wiped clean!)*")
-    except ValueError:
-        await ctx.send("Invalid format. Please use: `~set_cm_start YYYY-MM-DD <number> <length> <surface>`")
 
-@bot.command()
+    await interaction.followup.send(f"CM{cm_number} ({length} {surface}) start date set to {date}.\n*(Old data was safely archived and the active leaderboard was wiped clean!)*")
+
+
+@bot.tree.command(name="reset_cm_data", description="Emergency command: wipe the active leaderboard and scanned image memory")
+@app_commands.guild_only()
 @admin_only
-@with_db_lock
-async def reset_cm_data(ctx):
-    """Emergency command to wipe the active leaderboard."""
-    db = load_db()
-    
-    # Reset all active tracking
-    db["days"] = {}
-    db["processed_messages"] = []
-    db["day_msg_ids"] = {}
-    db["last_ranking_msg_id"] = None
-    
-    save_db(db)
-    await ctx.send("Active leaderboard and scanned image memory have been completely wiped", delete_after=5)
+async def reset_cm_data(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async with db_lock:
+        db = load_db()
+
+        # Reset all active tracking
+        db["days"] = {}
+        db["processed_messages"] = []
+        db["day_msg_ids"] = {}
+        db["last_ranking_msg_id"] = None
+
+        save_db(db)
+
+    await interaction.followup.send("Active leaderboard and scanned image memory have been completely wiped", ephemeral=True)
 
 
-@bot.command()
+@bot.tree.command(name="edit_score", description="Manually fix a player's score for a day")
+@app_commands.describe(
+    day="The CM day to fix",
+    user="The player whose score should be changed",
+    wins="Total 1st place wins up to this day",
+    races="Total races up to this day",
+)
+@app_commands.guild_only()
 @admin_only
-@with_db_lock
-async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
-    """
-    Manually fix a score. 
-    Usage: 
-    ~edit_score 1 123456789012345678 15 20  (By ID)
-    ~edit_score 1 @User 15 20               (By Mention)
-    ~edit_score 1 "User Name" 15 20         (By Name in quotes)
-    """
-    db = load_db()
+async def edit_score(interaction: discord.Interaction, day: app_commands.Range[int, 1], user: discord.Member,
+                     wins: app_commands.Range[int, 0], races: app_commands.Range[int, 0]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        print("Bot lacks 'Manage Messages' permission to delete the user's command.")
-    except Exception as e:
-        print(f"Error deleting message: {e}")
-    
-    # 1. Try to find the member
-    member = None
-    
-    # Try by ID or Mention
-    try:
-        # converter.MemberConverter handles mentions and IDs automatically
-        converter = commands.MemberConverter()
-        member = await converter.convert(ctx, user_input)
-    except commands.BadArgument:
-        # If that fails, search by name in the current guild
-        member = discord.utils.get(ctx.guild.members, name=user_input) or \
-                 discord.utils.get(ctx.guild.members, display_name=user_input)
+    async with db_lock:
+        db = load_db()
+        day_num = day
+        user_id = str(user.id)
 
-    if not member:
-        await ctx.send(f"❌ Could not find user '{user_input}'. Try using their User ID.")
-        return
+        # Update data
+        if str(day_num) not in db["days"]: db["days"][str(day_num)] = {}
+        db["days"][str(day_num)][user_id] = {"name": user.display_name, "wins": wins, "races": races}
+        save_db(db)
 
-    db = load_db()
-    day_num = int(day)
-    user_id = str(member.id)
-    
-   # Update data
-    if str(day_num) not in db["days"]: db["days"][str(day_num)] = {}
-    db["days"][str(day_num)][user_id] = {"name": member.display_name, "wins": wins, "races": races}
-    save_db(db)
+        await interaction.followup.send(f"Updated **{user.display_name}** to {wins}/{races}. Refreshing table...", ephemeral=True)
 
-    await ctx.send(f"Updated **{member.display_name}** to {wins}/{races}. Refreshing table...", delete_after=5)
-
-    # --- AUTO-EDIT THE SPECIFIC DAY'S MESSAGE ---
-    msg_id = db.get("day_msg_ids", {}).get(str(day_num))
-    ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
-    
-    if ranking_channel and isinstance(ranking_channel, discord.TextChannel):
-        updated_text = get_rankings_text(db, day_num)
-        edited_successfully = False
-
-        if msg_id:
-            try:
-                # Try to fetch and edit the existing message
-                msg = await ranking_channel.fetch_message(msg_id)
-                await msg.edit(content=updated_text)
-                edited_successfully = True
-            except discord.NotFound:
-                # 404 Error: The message was deleted or is in the old channel!
-                pass 
-            except Exception as e:
-                await ctx.send(f"Score saved, but could not edit the ranking table: {e}", delete_after=5)
-                edited_successfully = True # Prevent it from posting a new one on a random API error
-
-        # If the old message couldn't be found (404), post a brand new one!
-        if not edited_successfully:
-            sent_msg = await ranking_channel.send(updated_text)
-            
-            # Update the database with the NEW message ID
-            if "day_msg_ids" not in db: 
-                db["day_msg_ids"] = {}
-                
-            db["day_msg_ids"][str(day_num)] = sent_msg.id
-            db["last_ranking_msg_id"] = sent_msg.id
-            save_db(db)
-
-
-@bot.command()
-@admin_only
-@with_db_lock
-async def set_name(ctx, user_input: str, *, custom_name: str):
-    """
-    Sets a permanent custom leaderboard name for a user.
-    Usage: ~set_name @User Cool Name
-    """
-    try:
-        await ctx.message.delete()
-    except:
-        pass
-
-    db = load_db()
-    
-    # 1. Try to find the member
-    member = None
-    try:
-        converter = commands.MemberConverter()
-        member = await converter.convert(ctx, user_input)
-    except commands.BadArgument:
-        member = discord.utils.get(ctx.guild.members, name=user_input) or \
-                 discord.utils.get(ctx.guild.members, display_name=user_input)
-
-    if not member:
-        await ctx.send(f"Could not find user '{user_input}'. Try using their User ID.", delete_after=5)
-        return
-
-    user_id = str(member.id)
-    
-    # Save the custom name
-    db["custom_names"][user_id] = custom_name
-    save_db(db)
-
-    await ctx.send(f"**{member.display_name}** will now be shown as **{custom_name}** on the leaderboard.", delete_after=5)
-
-    # --- AUTO-REFRESH THE LEADERBOARD ---
-    day_num = db.get("last_ranking_day")
-    if day_num:
+        # --- AUTO-EDIT THE SPECIFIC DAY'S MESSAGE ---
         msg_id = db.get("day_msg_ids", {}).get(str(day_num))
         ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
-        
-        if msg_id and ranking_channel and isinstance(ranking_channel, discord.TextChannel):
-            try:
-                updated_text = get_rankings_text(db, day_num)
-                msg = await ranking_channel.fetch_message(msg_id)
-                await msg.edit(content=updated_text)
-            except:
-                pass
 
-@bot.command()
+        if ranking_channel and isinstance(ranking_channel, discord.TextChannel):
+            updated_text = get_rankings_text(db, day_num)
+            edited_successfully = False
+
+            if msg_id:
+                try:
+                    # Try to fetch and edit the existing message
+                    msg = await ranking_channel.fetch_message(msg_id)
+                    await msg.edit(content=updated_text)
+                    edited_successfully = True
+                except discord.NotFound:
+                    # 404 Error: The message was deleted or is in the old channel!
+                    pass
+                except Exception as e:
+                    await interaction.followup.send(f"Score saved, but could not edit the ranking table: {e}", ephemeral=True)
+                    edited_successfully = True # Prevent it from posting a new one on a random API error
+
+            # If the old message couldn't be found (404), post a brand new one!
+            if not edited_successfully:
+                sent_msg = await ranking_channel.send(updated_text)
+
+                # Update the database with the NEW message ID
+                if "day_msg_ids" not in db:
+                    db["day_msg_ids"] = {}
+
+                db["day_msg_ids"][str(day_num)] = sent_msg.id
+                db["last_ranking_msg_id"] = sent_msg.id
+                save_db(db)
+
+
+@bot.tree.command(name="set_name", description="Set a permanent custom leaderboard name for a player")
+@app_commands.describe(user="The player to rename", custom_name="The name to show on the leaderboard")
+@app_commands.guild_only()
 @admin_only
-@with_db_lock
-async def unlink_day(ctx, day: str):
-    """Makes the bot forget the old message ID so it creates a new leaderboard."""
-    try: 
-        await ctx.message.delete()
-    except: 
-        pass
+async def set_name(interaction: discord.Interaction, user: discord.Member, custom_name: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    db = load_db()
-    if "day_msg_ids" in db and day in db["day_msg_ids"]:
-        del db["day_msg_ids"][day]
+    async with db_lock:
+        db = load_db()
+
+        # Save the custom name
+        db["custom_names"][str(user.id)] = custom_name
         save_db(db)
-        await ctx.send(f"🔗 Unlinked the old message for Day {day}! The next update will post a brand new leaderboard.", delete_after=5)
-    else:
-        await ctx.send(f"⚠️ No message ID found for Day {day}.", delete_after=5)
+
+        await interaction.followup.send(f"**{user.display_name}** will now be shown as **{custom_name}** on the leaderboard.", ephemeral=True)
+
+        # --- AUTO-REFRESH THE LEADERBOARD ---
+        day_num = db.get("last_ranking_day")
+        if day_num:
+            msg_id = db.get("day_msg_ids", {}).get(str(day_num))
+            ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+
+            if msg_id and ranking_channel and isinstance(ranking_channel, discord.TextChannel):
+                try:
+                    updated_text = get_rankings_text(db, day_num)
+                    msg = await ranking_channel.fetch_message(msg_id)
+                    await msg.edit(content=updated_text)
+                except:
+                    pass
 
 
+@bot.tree.command(name="unlink_day", description="Forget a day's leaderboard message so the next update posts a new one")
+@app_commands.describe(day="The CM day to unlink")
+@app_commands.guild_only()
+@admin_only
+async def unlink_day(interaction: discord.Interaction, day: app_commands.Range[int, 1]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    day = str(day)
 
-@bot.command(name='help')
-async def help_command(ctx):
-    """Displays a beautiful custom help menu."""
-    
+    async with db_lock:
+        db = load_db()
+        if "day_msg_ids" in db and day in db["day_msg_ids"]:
+            del db["day_msg_ids"][day]
+            save_db(db)
+            await interaction.followup.send(f"🔗 Unlinked the old message for Day {day}! The next update will post a brand new leaderboard.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"⚠️ No message ID found for Day {day}.", ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Show how to use the CM leaderboard bot")
+async def help_command(interaction: discord.Interaction):
+    """Displays a custom help menu."""
+
     # We use a Discord Embed to make it look like an official UI panel
     embed = discord.Embed(
         title="Uma Musume CM Leaderboard Bot",
         description="Welcome to the CM Leaderboard! Here is how to use my commands:",
         color=discord.Color.green() # You can change this to .blue(), .red(), .gold(), etc.
     )
-    
+
     # 1. Set CM Start
     embed.add_field(
-        name="`~set_cm_start <Date> <Number> <Length> <Surface>`",
+        name="`/set_cm_start <date> <cm_number> <length> <surface>`",
         value=(
             "Initializes the Champions Meeting settings. **You must run this first!**\n"
             "**Format:** `YYYY-MM-DD`\n"
-            "**Example:** `~set_cm_start 2026-03-30 11 3200m Turf`"
+            "**Example:** `/set_cm_start 2026-03-30 11 3200m Turf`"
         ),
         inline=False
     )
-    
+
     # 2. Calculate Day
     embed.add_field(
-        name="`~calculate_day <Day Number>`",
+        name="`/calculate_day <day>`",
         value=(
             "Scans the `uma-musume` channel for all screenshots posted during that specific day. "
             "It automatically extracts the wins/races and generates the leaderboard.\n"
-            "**Example:** `~calculate_day 1`"
+            "**Example:** `/calculate_day 1`"
         ),
         inline=False
     )
-    
+
     # 3. Edit Score
     embed.add_field(
-        name="`~edit_score <Day> <User> <Wins> <Races>`",
+        name="`/edit_score <day> <user> <wins> <races>`",
         value=(
             "Manually fixes a score if the AI makes a mistake reading a screenshot. "
             "Automatically updates the active leaderboard message without spamming the chat.\n"
-            "*(You can use a @mention, a User ID, or their \"Name in quotes\")*\n"
-            "**Example:** `~edit_score 1 @Zyf 18 20`"
+            "**Example:** `/edit_score 1 @Zyf 18 20`"
         ),
         inline=False
     )
 
     # 4. Set Custom Name
     embed.add_field(
-        name="`~set_name <User> <Custom Name>`",
+        name="`/set_name <user> <custom_name>`",
         value=(
             "Forces the leaderboard to use a specific name for a user instead of their Discord nickname.\n"
-            "**Example:** `~set_name @Zyf Uma Master`"
+            "**Example:** `/set_name @Zyf Uma Master`"
         ),
         inline=False
     )
 
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == '__main__':
