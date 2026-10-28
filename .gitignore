@@ -1,2 +1,5 @@
 *.env
 database.json
+__pycache__/
+.idea/
+venv/
