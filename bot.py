@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import asyncio
 import base64
+import functools
 from openai import OpenAI
 
 load_dotenv("secrets.env")
@@ -37,6 +38,21 @@ bot = commands.Bot(command_prefix='~', intents=intents)
 
 bot.remove_command('help')
 
+# Only one handler may load -> modify -> save the database at a time,
+# otherwise two screenshots posted at once overwrite each other's results
+db_lock = asyncio.Lock()
+
+def with_db_lock(func):
+    """Runs a command while holding db_lock."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with db_lock:
+            return await func(*args, **kwargs)
+    return wrapper
+
+# Commands that change the leaderboard need "Manage Messages" permission
+admin_only = commands.has_permissions(manage_messages=True)
+
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
@@ -48,10 +64,22 @@ def load_db():
     return {"processed_messages": [], "days": {}, "custom_names": {}}
 
 def save_db(data):
-    with open(DB_FILE, 'w') as f:
+    # Write to a temp file first and swap it in, so a crash mid-write can't corrupt the database
+    tmp_file = DB_FILE + ".tmp"
+    with open(tmp_file, 'w') as f:
         json.dump(data, f, indent=4)
+    os.replace(tmp_file, DB_FILE)
 
-def extract_data_from_image(image_bytes, force_parse=False):
+def apply_reading(db, day_str, user_id, user_name, wins, races):
+    """Screenshots show cumulative totals, so the reading with the most races replaces the stored one."""
+    if day_str not in db["days"]:
+        db["days"][day_str] = {}
+
+    entry = db["days"][day_str].get(user_id)
+    if entry is None or races >= entry["races"]:
+        db["days"][day_str][user_id] = {"name": user_name, "wins": wins, "races": races}
+
+def extract_data_from_image(image_bytes):
     """Uses Cloudflare's free Llama 3.2 Vision model."""
     try:
         original_img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
@@ -156,8 +184,9 @@ def get_rankings_text(db, day_num):
             daily_stats.append({"name": total_data["name"], "wins": daily_w, "races": daily_r, "rate": daily_rate})
 
     # 4. Format Strings
-    daily_stats.sort(key=lambda x: x["rate"], reverse=True)
-    total_stats.sort(key=lambda x: x["rate"], reverse=True)
+    # Sort by win rate, more wins breaks ties (so 19/20 isn't beaten by 1/1 on equal footing)
+    daily_stats.sort(key=lambda x: (x["rate"], x["wins"]), reverse=True)
+    total_stats.sort(key=lambda x: (x["rate"], x["wins"]), reverse=True)
 
     cm_num = db.get("cm_number", "??")
     cm_len = db.get("cm_length", "???m")
@@ -198,6 +227,15 @@ async def on_ready():
     print(f'{bot.user} is now running!')
 
 @bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need the **Manage Messages** permission to use this command.", delete_after=5)
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        print(f"Error in command '{ctx.command}': {error}")
+
+@bot.event
 async def on_message(message):
     # CRITICAL: Without this line, your bot will ignore all ~commands!
     await bot.process_commands(message)
@@ -206,8 +244,8 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Only watch the uma-musume channel
-    if message.channel.name != "uma-musume":
+    # Only watch the uma-musume channel (DM channels have no name, so use getattr)
+    if getattr(message.channel, "name", None) != "uma-musume":
         return
 
     # Check if there are attachments
@@ -238,8 +276,8 @@ async def on_message(message):
     day_str = str(day_num)
 
     # --- Process the image(s) ---
-    processed_any = False
-    message_contains_valid_screenshot = False
+    # The slow AI calls happen before taking the lock, so other posts aren't blocked meanwhile
+    readings = []
 
     for attachment in valid_images:
         # Add a magnifying glass reaction to show the bot is scanning
@@ -250,75 +288,69 @@ async def on_message(message):
             async with session.get(attachment.url) as resp:
                 if resp.status == 200:
                     image_bytes = await resp.read()
-                    
-                    wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes, message_contains_valid_screenshot)
-                    
+
+                    wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+
                     if wins is not None and races is not None:
-                        message_contains_valid_screenshot = True
-                        processed_any = True
-                        
-                        user_id = str(message.author.id)
-                        user_name = message.author.display_name
-                        
-                        if day_str not in db["days"]:
-                            db["days"][day_str] = {}
-                            
-                        if user_id not in db["days"][day_str]:
-                            db["days"][day_str][user_id] = {"name": user_name, "wins": 0, "races": 0}
-                            
-                        db["days"][day_str][user_id]["wins"] += wins
-                        db["days"][day_str][user_id]["races"] = max(db["days"][day_str][user_id]["races"], races)
-                        
-                        print(f"Live processed image from {user_name}: {wins} wins, {races} races.")
+                        readings.append((wins, races))
+                        print(f"Live processed image from {message.author.display_name}: {wins} wins, {races} races.")
 
 # --- Update the Leaderboard ---
-    if processed_any:
-        db["processed_messages"].append(message.id)
-        
+    if readings:
         # Swap 🔍 for ✅
         try:
             await message.remove_reaction("🔍", bot.user)
             await message.add_reaction("✅")
         except: pass
 
-        ranking_text = get_rankings_text(db, day_num)
-        
-        # Get the specific ranking channel
-        ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
-        if not ranking_channel:
-            print("❌ Could not find the ranking channel!")
-            return
+        async with db_lock:
+            # Reload inside the lock so we build on any results saved while we were scanning
+            db = load_db()
 
-        if not isinstance(ranking_channel, discord.TextChannel):
-            print("❌ Ranking channel is not a text channel!")
-            return
+            user_id = str(message.author.id)
+            for wins, races in readings:
+                apply_reading(db, day_str, user_id, message.author.display_name, wins, races)
 
-        if "day_msg_ids" not in db:
-            db["day_msg_ids"] = {}
-            
-        msg_id_to_edit = db["day_msg_ids"].get(day_str)
-        
-        if msg_id_to_edit:
-            try:
-                # Fetch from the ranking channel instead of the current channel
-                msg = await ranking_channel.fetch_message(msg_id_to_edit)
-                await msg.edit(content=ranking_text)
-                save_db(db)
-            except discord.NotFound:
-                # If the old leaderboard was deleted, post a new one in the ranking channel
+            db["processed_messages"].append(message.id)
+            save_db(db)
+
+            ranking_text = get_rankings_text(db, day_num)
+
+            # Get the specific ranking channel
+            ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+            if not ranking_channel:
+                print("❌ Could not find the ranking channel!")
+                return
+
+            if not isinstance(ranking_channel, discord.TextChannel):
+                print("❌ Ranking channel is not a text channel!")
+                return
+
+            if "day_msg_ids" not in db:
+                db["day_msg_ids"] = {}
+
+            msg_id_to_edit = db["day_msg_ids"].get(day_str)
+
+            if msg_id_to_edit:
+                try:
+                    # Fetch from the ranking channel instead of the current channel
+                    msg = await ranking_channel.fetch_message(msg_id_to_edit)
+                    await msg.edit(content=ranking_text)
+                except discord.NotFound:
+                    # If the old leaderboard was deleted, post a new one in the ranking channel
+                    sent_msg = await ranking_channel.send(ranking_text)
+                    db["day_msg_ids"][day_str] = sent_msg.id
+                    db["last_ranking_msg_id"] = sent_msg.id
+                    db["last_ranking_day"] = day_num
+                    save_db(db)
+            else:
+                # First image of the day! Post a brand new leaderboard in the ranking channel
                 sent_msg = await ranking_channel.send(ranking_text)
                 db["day_msg_ids"][day_str] = sent_msg.id
                 db["last_ranking_msg_id"] = sent_msg.id
                 db["last_ranking_day"] = day_num
                 save_db(db)
-        else:
-            # First image of the day! Post a brand new leaderboard in the ranking channel
-            sent_msg = await ranking_channel.send(ranking_text)
-            db["day_msg_ids"][day_str] = sent_msg.id
-            db["last_ranking_msg_id"] = sent_msg.id
-            db["last_ranking_day"] = day_num
-            save_db(db)
-            
+
     else:
         # If it scanned the image but couldn't read the numbers, swap 🔍 for ❌
         try:
@@ -327,6 +359,7 @@ async def on_message(message):
         except: pass
 
 @bot.command()
+@with_db_lock
 async def calculate_day(ctx, day: str):
     # --- NEW: Delete the user's command message silently ---
     try:
@@ -384,29 +417,18 @@ async def calculate_day(ctx, day: str):
             if not valid_images_to_process:
                 continue
 
-            # Flag to track if this Discord message contains at least one valid screenshot
-            message_contains_valid_screenshot = False
-            
             for attachment in valid_images_to_process:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(attachment.url) as resp:
                         if resp.status == 200:
                             image_bytes = await resp.read()
                             
-                            wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes, message_contains_valid_screenshot)
-                            
+                            wins, races = await asyncio.to_thread(extract_data_from_image, image_bytes)
+
                             if wins is not None and races is not None:
-                                message_contains_valid_screenshot = True 
-                                
-                                user_id = str(message.author.id)
                                 user_name = message.author.display_name
-                                
-                                if user_id not in db["days"][day]:
-                                    db["days"][day][user_id] = {"name": user_name, "wins": 0, "races": 0}
-                                    
-                                db["days"][day][user_id]["wins"] += wins
-                                db["days"][day][user_id]["races"] = max(db["days"][day][user_id]["races"], races)
-                                
+                                apply_reading(db, day, str(message.author.id), user_name, wins, races)
+
                                 print(f"Processed image from {user_name}: {wins} wins, {races} races.")
                             else:
                                 # --- DETAILED ERROR LOGGING ADDED HERE ---
@@ -430,19 +452,24 @@ async def calculate_day(ctx, day: str):
         
     msg_id_to_edit = db["day_msg_ids"].get(day)
     edited_successfully = False
-    
+
+    # Always use the ranking channel, no matter where the command was typed
+    ranking_channel = bot.get_channel(RANKING_CHANNEL_ID)
+    if not isinstance(ranking_channel, discord.TextChannel):
+        ranking_channel = ctx.channel
+
     # Try to edit the existing message for this specific day
     if msg_id_to_edit:
         try:
-            msg = await ctx.channel.fetch_message(msg_id_to_edit)
+            msg = await ranking_channel.fetch_message(msg_id_to_edit)
             await msg.edit(content=ranking_text)
             edited_successfully = True
         except discord.NotFound:
             pass # The old message was manually deleted in Discord, so we will post a new one
-            
+
     # If no message exists (or it was deleted), send a new one
     if not edited_successfully:
-        sent_msg = await ctx.send(ranking_text)
+        sent_msg = await ranking_channel.send(ranking_text)
         db["day_msg_ids"][day] = sent_msg.id
         db["last_ranking_msg_id"] = sent_msg.id # Keep for edit_score fallback
         db["last_ranking_day"] = day_num
@@ -462,6 +489,8 @@ async def calculate_day(ctx, day: str):
 
 
 @bot.command()
+@admin_only
+@with_db_lock
 async def set_cm_start(ctx, date_str: str, cm_number: int, length: str, surface: str):
     """
     Sets the start date of the CM. Automatically archives old data!
@@ -504,6 +533,8 @@ async def set_cm_start(ctx, date_str: str, cm_number: int, length: str, surface:
         await ctx.send("Invalid format. Please use: `~set_cm_start YYYY-MM-DD <number> <length> <surface>`")
 
 @bot.command()
+@admin_only
+@with_db_lock
 async def reset_cm_data(ctx):
     """Emergency command to wipe the active leaderboard."""
     db = load_db()
@@ -519,6 +550,8 @@ async def reset_cm_data(ctx):
 
 
 @bot.command()
+@admin_only
+@with_db_lock
 async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
     """
     Manually fix a score. 
@@ -599,6 +632,8 @@ async def edit_score(ctx, day: str, user_input: str, wins: int, races: int):
 
 
 @bot.command()
+@admin_only
+@with_db_lock
 async def set_name(ctx, user_input: str, *, custom_name: str):
     """
     Sets a permanent custom leaderboard name for a user.
@@ -647,6 +682,8 @@ async def set_name(ctx, user_input: str, *, custom_name: str):
                 pass
 
 @bot.command()
+@admin_only
+@with_db_lock
 async def unlink_day(ctx, day: str):
     """Makes the bot forget the old message ID so it creates a new leaderboard."""
     try: 
